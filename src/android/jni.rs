@@ -523,11 +523,27 @@ fn process_input_events(app: &AndroidApp) {
                                     _ => continue,
                                 };
 
+                                // A move carries the samples batched since the
+                                // previous one; each has its own time, and the
+                                // window resamples them at the frame's.
+                                if touch_action == AMOTION_EVENT_ACTION_MOVE {
+                                    for historical in pointer.history() {
+                                        win.handle_touch(crate::android::TouchPoint {
+                                            id: pointer.pointer_id(),
+                                            x: historical.x(),
+                                            y: historical.y(),
+                                            action: touch_action,
+                                            time: Some(historical.event_time()),
+                                        });
+                                    }
+                                }
+
                                 let touch = crate::android::TouchPoint {
                                     id: pointer.pointer_id(),
                                     x: pointer.x(),
                                     y: pointer.y(),
                                     action: touch_action,
+                                    time: Some(motion_event.event_time()),
                                 };
 
                                 log::debug!(

@@ -234,6 +234,10 @@ pub struct TouchPoint {
     pub y: f32,
     /// `AMOTION_EVENT_ACTION_*` action masked to a single pointer.
     pub action: u32,
+    /// When the pointer was here, in nanoseconds of the monotonic clock
+    /// (`MotionEvent`'s event time), or `None` for now. Moves are resampled
+    /// at the frame's time from these (`touch_resampler`).
+    pub time: Option<i64>,
 }
 
 // ── shared logging helper ─────────────────────────────────────────────────────

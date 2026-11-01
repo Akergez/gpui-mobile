@@ -42,7 +42,7 @@ use std::{
     cell::RefCell,
     ptr,
     sync::{
-        atomic::{AtomicBool, AtomicPtr, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicPtr, Ordering},
         mpsc, OnceLock,
     },
     time::{Duration, Instant},
@@ -80,6 +80,10 @@ static POST_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// A frame callback fired and its frame has not been handed to the pacer yet.
 static FRAME_DUE: AtomicBool = AtomicBool::new(false);
+
+/// The time of the latest vsync, in nanoseconds of the monotonic clock; 0
+/// before the first.
+static VSYNC_TIME: AtomicI64 = AtomicI64::new(0);
 
 /// Demand raised from a thread that is not the loop thread; the loop turns it
 /// into [`schedule_frame`] on its next iteration.
@@ -168,10 +172,13 @@ fn vsync_thread(ready: mpsc::Sender<bool>) {
     }
 }
 
+// `c_long` is 32 bits on 32-bit Android: the conversion is not useless there.
+#[allow(clippy::useless_conversion)]
 unsafe extern "C" fn on_vsync(
-    _frame_time_nanos: std::os::raw::c_long,
+    frame_time_nanos: std::os::raw::c_long,
     _data: *mut std::ffi::c_void,
 ) {
+    VSYNC_TIME.store(i64::from(frame_time_nanos), Ordering::Release);
     FRAME_DUE.store(true, Ordering::Release);
     wake_looper(&MAIN_LOOPER);
 }
@@ -250,4 +257,31 @@ pub(crate) fn poll_timeout(next_delayed_task: Option<Instant>, can_draw: bool) -
 /// from another thread). A no-op before [`install`].
 pub(crate) fn wake() {
     wake_looper(&MAIN_LOOPER);
+}
+
+/// Now, in nanoseconds of the monotonic clock: the clock `MotionEvent` times
+/// and vsync times are on.
+// `time_t` and `c_long` are 32 bits on 32-bit Android.
+#[allow(clippy::useless_conversion)]
+pub(crate) fn now() -> i64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` only writes the timespec it is given.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    i64::from(time.tv_sec) * 1_000_000_000 + i64::from(time.tv_nsec)
+}
+
+/// The time the frame being drawn stands for: the vsync it was due on, or
+/// now when it was not (a loop behind its vsyncs, the clock fallback, a
+/// vsync long past). Touch moves are resampled at it.
+pub(crate) fn frame_time() -> i64 {
+    let now = now();
+    let vsync = VSYNC_TIME.load(Ordering::Acquire);
+    if vsync > 0 && (0..=REFRESH_INTERVAL.as_nanos() as i64).contains(&(now - vsync)) {
+        vsync
+    } else {
+        now
+    }
 }

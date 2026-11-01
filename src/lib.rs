@@ -82,6 +82,8 @@ pub mod momentum;
 pub mod packages;
 pub mod platform_view;
 pub mod target_platform;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) mod touch_resampler;
 
 // ── System chrome (status bar / navigation bar) styling ──────────────────────
 

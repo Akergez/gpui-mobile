@@ -138,6 +138,23 @@ fn load_set_frame_rate_with_change_strategy() -> Option<SetFrameRateWithChangeSt
     })
 }
 
+/// A resampled touch, back in the shape the touch callback takes.
+fn sample_to_point(sample: crate::touch_resampler::Sample) -> TouchPoint {
+    use crate::touch_resampler::Phase;
+    TouchPoint {
+        id: sample.id,
+        x: sample.x,
+        y: sample.y,
+        action: match sample.phase {
+            Phase::Down => 0,
+            Phase::Up => 1,
+            Phase::Move => 2,
+            Phase::Cancel => 3,
+        },
+        time: Some(sample.time),
+    }
+}
+
 /// Request 120 Hz refresh rate from the native window when the platform exposes the API.
 ///
 /// The NDK entry points are resolved with `dlsym` so this library still loads
@@ -324,6 +341,10 @@ pub struct AndroidWindow {
     /// lifecycle handlers can set it without acquiring the state lock
     /// (which may be held by a background render thread).
     active: Arc<std::sync::atomic::AtomicBool>,
+    /// Touch moves held for the next frame and resampled at its time
+    /// (`touch_resampler`): one even step per frame, whatever the rate the
+    /// screen reports at.
+    touches: Mutex<crate::touch_resampler::TouchResampler>,
     /// Set when the window gets a *new* surface, cleared by the next frame.
     ///
     /// A replaced swapchain starts out empty, but GPUI only repaints what it
@@ -409,6 +430,7 @@ impl AndroidWindow {
             state,
             id,
             active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            touches: Mutex::default(),
             force_render_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }))
     }
@@ -443,6 +465,7 @@ impl AndroidWindow {
             state,
             id: ((width as u64) << 32) | (height as u64),
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            touches: Mutex::default(),
             force_render_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
@@ -769,6 +792,17 @@ impl AndroidWindow {
     /// `AndroidWindow::draw`, which needs to acquire the same `state` lock
     /// to access the renderer.
     pub fn request_frame(&self) {
+        // The moves held since the last frame go in first, resampled at this
+        // frame's time, so that it draws them. Movement the resampled time
+        // has not reached yet asks for the next frame.
+        let moves = self.touches.lock().frame(super::frame_source::frame_time());
+        for sample in moves {
+            self.dispatch_touch(sample_to_point(sample));
+        }
+        if self.touches.lock().pending() {
+            super::frame_source::schedule_frame();
+        }
+
         // Take the callback out of the lock so it can be invoked without
         // holding it.  This lets `draw()` (called from inside the callback)
         // acquire the lock for the renderer.
@@ -792,12 +826,38 @@ impl AndroidWindow {
 
     // ── input event delivery ──────────────────────────────────────────────────
 
+    /// Deliver a touch point. Downs, ups and cancels reach the touch callback
+    /// at once; moves wait for the next frame, which hands GPUI one position
+    /// per pointer resampled at its time (`touch_resampler`).
+    pub fn handle_touch(&self, point: TouchPoint) {
+        use crate::touch_resampler::{Phase, Sample};
+        let phase = match point.action {
+            0 => Phase::Down,
+            1 => Phase::Up,
+            2 => Phase::Move,
+            3 => Phase::Cancel,
+            _ => return self.dispatch_touch(point),
+        };
+        let sample = Sample {
+            id: point.id,
+            phase,
+            x: point.x,
+            y: point.y,
+            time: point.time.unwrap_or_else(super::frame_source::now),
+        };
+        let ready = self.touches.lock().push(sample);
+        match ready {
+            Some(sample) => self.dispatch_touch(sample_to_point(sample)),
+            None => super::frame_source::schedule_frame(),
+        }
+    }
+
     /// Deliver a touch point to the registered touch callback.
     ///
     /// The callback is taken out of the lock before invocation (same pattern
     /// as `request_frame`) to avoid potential deadlocks if the callback
     /// re-enters any window method that needs the lock.
-    pub fn handle_touch(&self, point: TouchPoint) {
+    fn dispatch_touch(&self, point: TouchPoint) {
         let cb = {
             let mut state = self.state.lock();
             state.touch_callback.take()
@@ -2017,6 +2077,7 @@ mod tests {
             x: 100.0,
             y: 200.0,
             action: 0,
+            time: None,
         });
 
         let pts = received.lock();
@@ -2122,21 +2183,27 @@ mod tests {
         (window, platform, events)
     }
 
-    fn send_touch(window: &AndroidWindow, action: u32, y: f32) {
+    /// A touch `ms` milliseconds into a contact that began 100 ms ago, so
+    /// that a frame drawn now is past every sample.
+    fn send_touch(window: &AndroidWindow, action: u32, y: f32, ms: i64) {
         window.handle_touch(TouchPoint {
             id: 1,
             x: 100.,
             y,
             action,
+            time: Some(super::super::frame_source::now() - 100_000_000 + ms * 1_000_000),
         });
     }
 
     #[test]
     fn touch_contacts_preserve_phases_and_logical_coordinates() {
         let (window, _platform, events) = touch_input_harness();
-        send_touch(&window, 0, 200.);
-        send_touch(&window, 2, 240.);
-        send_touch(&window, 1, 242.);
+        send_touch(&window, 0, 200., 0);
+        send_touch(&window, 2, 240., 10);
+        // A move waits for the frame.
+        assert_eq!(events.lock().len(), 1);
+        window.request_frame();
+        send_touch(&window, 1, 240., 20);
         let events = events.lock();
         assert_eq!(events.len(), 3);
         let contacts = events
@@ -2156,37 +2223,38 @@ mod tests {
             gpui::point(gpui::px(50.), gpui::px(100.))
         );
         assert_eq!(contacts[1].position.y, gpui::px(120.));
-        assert_eq!(contacts[2].position.y, gpui::px(121.));
+        assert_eq!(contacts[2].position.y, gpui::px(120.));
         assert!(contacts.iter().all(|touch| touch.id == contacts[0].id));
     }
 
     #[test]
     fn touch_cancel_is_forwarded_and_discards_stray_moves() {
         let (window, _platform, events) = touch_input_harness();
-        send_touch(&window, 0, 200.);
-        send_touch(&window, 2, 250.);
-        send_touch(&window, 3, 250.);
-        send_touch(&window, 2, 280.);
-        send_touch(&window, 1, 280.);
+        send_touch(&window, 0, 200., 0);
+        send_touch(&window, 2, 250., 10);
+        send_touch(&window, 3, 250., 20);
+        send_touch(&window, 2, 280., 30);
+        send_touch(&window, 1, 280., 40);
         window.request_frame();
         let events = events.lock();
-        assert_eq!(events.len(), 3);
-        assert!(matches!(&events[2], gpui::PlatformInput::Touch(event)
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[1], gpui::PlatformInput::Touch(event)
             if event.phase == gpui::TouchPhase::Cancelled));
     }
 
     #[test]
     fn touch_pointer_ids_are_not_reused_across_contacts() {
         let (window, _platform, events) = touch_input_harness();
-        send_touch(&window, 0, 200.);
+        send_touch(&window, 0, 200., 0);
         window.handle_touch(TouchPoint {
             id: 2,
             x: 120.,
             y: 220.,
             action: 0,
+            time: None,
         });
-        send_touch(&window, 1, 200.);
-        send_touch(&window, 0, 200.);
+        send_touch(&window, 1, 200., 10);
+        send_touch(&window, 0, 200., 0);
         let events = events.lock();
         let ids = events
             .iter()
