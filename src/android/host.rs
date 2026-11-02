@@ -264,6 +264,7 @@ fn render_thread(launch: Launch) {
             if let Some(win) = &window {
                 win.request_frame();
             }
+            super::frame_source::end_frame();
         }
 
         // Sleep on the looper until a command, a dispatcher task or the vsync

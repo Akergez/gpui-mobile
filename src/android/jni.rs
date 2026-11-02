@@ -872,6 +872,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                     if let Some(win) = platform.primary_window() {
                         win.request_frame();
                     }
+                    super::frame_source::end_frame();
                 }
             }
         }

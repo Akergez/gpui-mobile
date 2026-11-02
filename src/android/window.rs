@@ -99,7 +99,64 @@ type SetFrameRateWithChangeStrategyFn =
 
 const DEFAULT_FRAME_RATE_COMPATIBILITY: i8 = 0;
 const ONLY_IF_SEAMLESS: i8 = 0;
+const CHANGE_ALWAYS: i8 = 1;
+
+/// Whether the display may switch to the asked rate even when the switch is
+/// not seamless (`ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS`).
+static CHANGE_ALWAYS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Lets the display switch to the asked rate even when the switch shows
+/// (`true`), or only when it is seamless (`false`, the default); applied to
+/// the primary window at once.
+pub fn set_change_always(always: bool) {
+    CHANGE_ALWAYS_ON.store(always, std::sync::atomic::Ordering::Relaxed);
+    set_frame_rate(frame_rate());
+}
+
+/// What the latest `ANativeWindow_setFrameRate*` returned: 0 accepted, a
+/// negative errno refused, `i32::MIN` not asked (before API 30).
+static FRAME_RATE_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
+
+/// See [`FRAME_RATE_STATUS`].
+pub fn frame_rate_status() -> i32 {
+    FRAME_RATE_STATUS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// See [`set_change_always`].
+pub fn change_always() -> bool {
+    CHANGE_ALWAYS_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
 const HIGH_FRAME_RATE: f32 = 120.0;
+
+/// The frame rate asked of every window, as `f32` bits: [`HIGH_FRAME_RATE`]
+/// unless [`set_frame_rate`] says otherwise; 0 is no preference.
+static FRAME_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(HIGH_FRAME_RATE.to_bits());
+
+/// The frame rate windows ask for from now on, applied to the primary window
+/// at once; 0 leaves the choice to the system.
+pub fn set_frame_rate(rate: f32) {
+    FRAME_RATE.store(rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    if let Some(window) = super::jni::platform().and_then(|platform| platform.primary_window()) {
+        let state = window.state.lock();
+        if let Some(native_window) = state.native_window.as_ref() {
+            request_high_frame_rate(native_window);
+        }
+    }
+}
+
+/// The frame rate windows ask for; 0 is no preference.
+pub fn frame_rate() -> f32 {
+    f32::from_bits(FRAME_RATE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// How frames reach the screen: `Mailbox` unless the environment variable
+/// `GPUI_PRESENT_MODE` is `fifo` when the surface is made.
+pub fn present_mode() -> wgpu::PresentMode {
+    match std::env::var("GPUI_PRESENT_MODE").as_deref() {
+        Ok("fifo") => wgpu::PresentMode::Fifo,
+        _ => wgpu::PresentMode::Mailbox,
+    }
+}
 
 // Resolve an optional libandroid symbol at runtime.
 //
@@ -107,9 +164,20 @@ const HIGH_FRAME_RATE: f32 = 120.0;
 // library fail to `dlopen` on older devices before our own code runs, so we
 // always go through `dlsym`. Keep this dynamic lookup even if `ndk` grows
 // nicer wrappers — reintroducing a static link would crash on pre-API-30.
+//
+// The lookup goes through libandroid's own handle: `RTLD_DEFAULT` does not
+// reach it from an application's linker namespace on recent Android, and the
+// frame rate was then never asked at all.
 fn load_libandroid_symbol(name: &[u8]) -> *mut c_void {
     debug_assert_eq!(name.last().copied(), Some(0));
-    unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr().cast()) }
+    static LIBANDROID: OnceLock<usize> = OnceLock::new();
+    let handle = *LIBANDROID.get_or_init(|| {
+        // SAFETY: opening a system library by name; it is already loaded.
+        unsafe { libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW) as usize }
+    });
+    let handle = if handle == 0 { libc::RTLD_DEFAULT } else { handle as *mut c_void };
+    // SAFETY: a lookup of a NUL-terminated symbol name in a valid handle.
+    unsafe { libc::dlsym(handle, name.as_ptr().cast()) }
 }
 
 fn load_set_frame_rate() -> Option<SetFrameRateFn> {
@@ -167,16 +235,16 @@ fn request_high_frame_rate(window: &NativeWindow) {
         load_set_frame_rate_with_change_strategy().map(|set_frame_rate| unsafe {
             set_frame_rate(
                 native_window,
-                HIGH_FRAME_RATE,
+                frame_rate(),
                 DEFAULT_FRAME_RATE_COMPATIBILITY,
-                ONLY_IF_SEAMLESS,
+                if change_always() { CHANGE_ALWAYS } else { ONLY_IF_SEAMLESS },
             )
         })
     } else if api_level >= 30 {
         load_set_frame_rate().map(|set_frame_rate| unsafe {
             set_frame_rate(
                 native_window,
-                HIGH_FRAME_RATE,
+                frame_rate(),
                 DEFAULT_FRAME_RATE_COMPATIBILITY,
             )
         })
@@ -184,8 +252,9 @@ fn request_high_frame_rate(window: &NativeWindow) {
         None
     };
 
+    FRAME_RATE_STATUS.store(status.unwrap_or(i32::MIN), std::sync::atomic::Ordering::Relaxed);
     match status {
-        Some(0) => log::info!("Requested 120 Hz frame rate"),
+        Some(0) => log::info!("Requested {} Hz frame rate", frame_rate()),
         Some(status) => log::warn!("ANativeWindow_setFrameRate* failed with status {status}"),
         None => log::debug!("Skipping high frame rate request on API {api_level}"),
     }
@@ -523,7 +592,7 @@ impl AndroidWindow {
             let config = WgpuSurfaceConfig {
                 size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
                 transparent,
-                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                preferred_present_mode: Some(present_mode()),
             };
             let instance = state
                 .gpu_context
@@ -774,7 +843,9 @@ impl AndroidWindow {
             }
         };
 
+        super::frame_stats::draw_begin();
         renderer.draw(scene);
+        super::frame_stats::draw_end();
 
         // Put the renderer back.
         let mut state = self.state.lock();
@@ -795,7 +866,9 @@ impl AndroidWindow {
         // The moves held since the last frame go in first, resampled at this
         // frame's time, so that it draws them. Movement the resampled time
         // has not reached yet asks for the next frame.
-        let moves = self.touches.lock().frame(super::frame_source::frame_time());
+        let frame_time = super::frame_source::frame_time();
+        super::frame_stats::tick_begin(frame_time);
+        let moves = self.touches.lock().frame(frame_time);
         for sample in moves {
             self.dispatch_touch(sample_to_point(sample));
         }
@@ -822,6 +895,7 @@ impl AndroidWindow {
                 state.request_frame_callback = Some(cb);
             }
         }
+        super::frame_stats::tick_end();
     }
 
     // ── input event delivery ──────────────────────────────────────────────────
@@ -1215,7 +1289,7 @@ impl AndroidWindow {
         let config = WgpuSurfaceConfig {
             size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
             transparent,
-            preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+            preferred_present_mode: Some(present_mode()),
         };
 
         WgpuRenderer::new(gpu_context, &raw, config, None)

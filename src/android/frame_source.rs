@@ -54,15 +54,15 @@ use crate::frame_pacer::FramePacer;
 /// this much latency instead of a frozen app.
 const IDLE_POLL_CAP: Duration = Duration::from_secs(1);
 
-/// The refresh interval the pacer assumes: a frame slower than this stops
-/// waiting for vsyncs, and the clock fallback spaces frames by it. 60 Hz is
-/// the common case; a faster display only makes an overrunning frame wait
-/// one extra vsync before pacing gives way.
+/// The spacing of the clock fallback (60 Hz), and the refresh interval the
+/// pacer assumes until vsyncs have measured the display's.
 const REFRESH_INTERVAL: Duration = Duration::from_micros(16_667);
 
 thread_local! {
     /// The loop thread's pacer, installed by [`install`].
     static PACER: RefCell<Option<FramePacer>> = const { RefCell::new(None) };
+    /// When the frame being drawn was taken, for [`end_frame`].
+    static FRAME_START: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
 /// The loop thread's `ALooper`, for [`wake`] from other threads.
@@ -152,6 +152,7 @@ fn vsync_thread(ready: mpsc::Sender<bool>) {
     }
     VSYNC_LOOPER.store(looper, Ordering::Release);
     let _ = ready.send(true);
+    register_refresh_rate_callback(choreographer);
 
     loop {
         if POST_REQUESTED.swap(false, Ordering::AcqRel) {
@@ -198,7 +199,7 @@ fn with_pacer<R>(f: impl FnOnce(&FramePacer) -> R) -> Option<R> {
         let slot = slot.borrow();
         let pacer = slot.as_ref()?;
         if FRAME_DUE.swap(false, Ordering::AcqRel) {
-            pacer.on_vsync();
+            pacer.on_vsync(VSYNC_TIME.load(Ordering::Acquire));
         }
         Some(f(pacer))
     })
@@ -228,7 +229,31 @@ pub(crate) fn take_frame() -> bool {
     if OFF_THREAD_DEMAND.swap(false, Ordering::AcqRel) {
         schedule_frame();
     }
-    with_pacer(|pacer| pacer.take_frame(Instant::now())).unwrap_or(false)
+    let now = Instant::now();
+    let taken = with_pacer(|pacer| pacer.take_frame(now)).unwrap_or(false);
+    if taken {
+        FRAME_START.with(|start| start.set(Some(now)));
+    }
+    taken
+}
+
+/// The frame [`take_frame`] handed out is drawn: its duration chooses how
+/// many vsyncs the next frames are spread over.
+pub(crate) fn end_frame() {
+    if let Some(start) = FRAME_START.with(|start| start.take()) {
+        with_pacer(|pacer| pacer.end_frame(start.elapsed()));
+    }
+}
+
+/// The display's refresh interval as the pacer measured it, in nanoseconds,
+/// and the number of vsyncs a frame is spread over.
+pub fn pacing() -> (i64, u32) {
+    with_pacer(|pacer| (pacer.period(), pacer.divisor())).unwrap_or((0, 1))
+}
+
+/// Spreads frames over `divisor` vsyncs whatever they take; 0 measures it.
+pub fn force_divisor(divisor: u32) {
+    with_pacer(|pacer| pacer.force_divisor(divisor));
 }
 
 /// How long the loop may block on its looper: zero with a frame due, up to
@@ -273,15 +298,48 @@ pub(crate) fn now() -> i64 {
     i64::from(time.tv_sec) * 1_000_000_000 + i64::from(time.tv_nsec)
 }
 
-/// The time the frame being drawn stands for: the vsync it was due on, or
-/// now when it was not (a loop behind its vsyncs, the clock fallback, a
-/// vsync long past). Touch moves are resampled at it.
+/// The time the frame being drawn stands for: the vsync it was drawn on, or
+/// now for a frame served at once (after an idle period, by the clock
+/// fallback). Touch moves are resampled at it.
 pub(crate) fn frame_time() -> i64 {
-    let now = now();
-    let vsync = VSYNC_TIME.load(Ordering::Acquire);
-    if vsync > 0 && (0..=REFRESH_INTERVAL.as_nanos() as i64).contains(&(now - vsync)) {
-        vsync
-    } else {
-        now
+    with_pacer(|pacer| pacer.frame_vsync())
+        .flatten()
+        .unwrap_or_else(now)
+}
+
+/// The display's refresh period as the system reports it (API 30+), in
+/// nanoseconds; 0 when unknown.
+static DISPLAY_PERIOD: AtomicI64 = AtomicI64::new(0);
+
+/// The display's refresh period as the system reports it, in nanoseconds; 0
+/// before API 30 or before the first report. Unlike the period between the
+/// vsyncs the application gets, this is the panel's own.
+pub fn display_period() -> i64 {
+    DISPLAY_PERIOD.load(Ordering::Relaxed)
+}
+
+type RefreshRateCallback = unsafe extern "C" fn(i64, *mut std::ffi::c_void);
+type RegisterRefreshRateCallback =
+    unsafe extern "C" fn(*mut ndk_sys::AChoreographer, RefreshRateCallback, *mut std::ffi::c_void);
+
+unsafe extern "C" fn on_refresh_rate(period: i64, _data: *mut std::ffi::c_void) {
+    DISPLAY_PERIOD.store(period, Ordering::Relaxed);
+}
+
+/// Asks the choreographer for the display's refresh rate changes; resolved
+/// with `dlsym`, the symbol being API 30's.
+fn register_refresh_rate_callback(choreographer: *mut ndk_sys::AChoreographer) {
+    // SAFETY: a lookup of a symbol by its NUL-terminated name.
+    let symbol = unsafe {
+        libc::dlsym(libc::RTLD_DEFAULT, c"AChoreographer_registerRefreshRateCallback".as_ptr())
+    };
+    if symbol.is_null() {
+        return;
+    }
+    // SAFETY: the symbol has this signature from API 30 on; the callback
+    // runs on this thread, through its looper.
+    unsafe {
+        let register = std::mem::transmute::<*mut std::ffi::c_void, RegisterRefreshRateCallback>(symbol);
+        register(choreographer, on_refresh_rate, ptr::null_mut());
     }
 }
