@@ -153,7 +153,7 @@ pub mod dispatcher;
 pub mod display;
 mod document_picker;
 pub(crate) mod frame_source;
-pub use frame_source::{display_period, force_divisor, pacing};
+pub use frame_source::{display_period, force_divisor, frame_vsync, pacing, touching};
 pub mod frame_stats;
 pub mod host;
 pub mod jni;

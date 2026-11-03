@@ -307,6 +307,28 @@ pub(crate) fn frame_time() -> i64 {
         .unwrap_or_else(now)
 }
 
+/// The time the frame being drawn stands for, in nanoseconds of the
+/// monotonic clock (see [`frame_time`]), for measuring what frames show.
+pub fn frame_vsync() -> i64 {
+    frame_time()
+}
+
+/// Contacts on the screen, for measuring what frames show.
+static CONTACTS: AtomicI64 = AtomicI64::new(0);
+
+/// Whether a finger is on the screen.
+pub fn touching() -> bool {
+    CONTACTS.load(Ordering::Relaxed) > 0
+}
+
+pub(crate) fn contact(down: bool) {
+    let delta = if down { 1 } else { -1 };
+    let left = CONTACTS.fetch_add(delta, Ordering::Relaxed) + delta;
+    if left < 0 {
+        CONTACTS.store(0, Ordering::Relaxed);
+    }
+}
+
 /// The display's refresh period as the system reports it (API 30+), in
 /// nanoseconds; 0 when unknown.
 static DISPLAY_PERIOD: AtomicI64 = AtomicI64::new(0);

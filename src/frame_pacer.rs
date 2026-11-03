@@ -26,6 +26,12 @@
 //! so a phone that cannot hold 120 Hz holds an even 60. The refresh interval
 //! is measured from the vsyncs' own times.
 //!
+//! Each run of frames after an idle period is measured afresh, at the full
+//! rate: what the previous one needed says nothing about this one, and its
+//! first few frames are not counted ([`WARMUP`]) — they are slow while the
+//! CPU wakes and its clock climbs, and counting them spread a short gesture
+//! over every third vsync.
+//!
 //! Without a vsync source (no looper on the thread, tests) the pacer falls
 //! back to a wall clock: demand becomes due one frame interval after the
 //! previous frame, and [`poll_timeout`](Self::poll_timeout) tells the loop
@@ -48,6 +54,12 @@ const DURATIONS: usize = 30;
 
 /// Frames in a row that would fit a smaller divisor before it is taken.
 const CALM: u32 = 60;
+
+/// Frames after an idle period whose durations are not counted.
+const WARMUP: u32 = 3;
+
+/// Durations counted before the divisor may rise.
+const RAISE_AFTER: usize = 5;
 
 /// The most vsyncs a frame is spread over.
 const MAX_DIVISOR: u32 = 3;
@@ -78,6 +90,8 @@ pub(crate) struct FramePacer {
     durations: RefCell<VecDeque<Duration>>,
     /// Frames in a row that would have fit a smaller divisor.
     calm: Cell<u32>,
+    /// Frames left whose durations are not counted.
+    warmup: Cell<u32>,
     /// A vsync callback is posted and has not fired yet.
     posted: Cell<bool>,
     /// A vsync fired (or the fallback clock ran out) and the frame it owes has
@@ -105,6 +119,7 @@ impl FramePacer {
             forced_divisor: Cell::new(0),
             durations: RefCell::new(VecDeque::with_capacity(DURATIONS)),
             calm: Cell::new(0),
+            warmup: Cell::new(0),
             posted: Cell::new(false),
             due: Cell::new(false),
             fallback_due_at: Cell::new(None),
@@ -125,6 +140,7 @@ impl FramePacer {
             forced_divisor: Cell::new(0),
             durations: RefCell::new(VecDeque::with_capacity(DURATIONS)),
             calm: Cell::new(0),
+            warmup: Cell::new(0),
             posted: Cell::new(false),
             due: Cell::new(false),
             fallback_due_at: Cell::new(None),
@@ -147,6 +163,10 @@ impl FramePacer {
             Some(_) if idle => {
                 self.due_vsync.set(None);
                 self.due.set(true);
+                self.durations.borrow_mut().clear();
+                self.divisor.set(1);
+                self.calm.set(0);
+                self.warmup.set(WARMUP);
             }
             Some(post) => {
                 self.posted.set(true);
@@ -231,6 +251,10 @@ impl FramePacer {
     /// percentile of the latest ones, rising at once, falling after
     /// [`CALM`] frames that would all have fit the smaller one.
     pub(crate) fn end_frame(&self, duration: Duration) {
+        if let Some(left) = self.warmup.get().checked_sub(1) {
+            self.warmup.set(left);
+            return;
+        }
         let mut durations = self.durations.borrow_mut();
         if durations.len() == DURATIONS {
             durations.pop_front();
@@ -243,7 +267,7 @@ impl FramePacer {
         let budget = self.period.get() as f64 * 0.9;
         let needed = ((p90.as_nanos() as f64 / budget).ceil() as u32).clamp(1, MAX_DIVISOR);
         let divisor = self.divisor.get();
-        if needed > divisor {
+        if needed > divisor && durations.len() >= RAISE_AFTER {
             self.divisor.set(needed);
             self.calm.set(0);
         } else if needed < divisor {
@@ -500,6 +524,49 @@ mod tests {
         assert_eq!(pacer.divisor(), 2);
         for _ in 0..CALM {
             frame(&pacer, Duration::from_millis(3));
+        }
+        assert_eq!(pacer.divisor(), 1);
+    }
+
+    #[test]
+    fn a_run_after_idle_starts_at_the_full_rate() {
+        let now = Instant::now();
+        let (pacer, _posts) = vsync_pacer_after_frame(now);
+        let period = 8 * MS;
+        let mut vsync = VSYNC;
+        let mut frame = |pacer: &FramePacer, duration: Duration| loop {
+            pacer.schedule(now);
+            pacer.on_vsync(vsync);
+            vsync += period;
+            if pacer.take_frame(now) {
+                pacer.end_frame(duration);
+                break;
+            }
+        };
+        for _ in 0..DURATIONS {
+            frame(&pacer, Duration::from_millis(20));
+        }
+        assert_eq!(pacer.divisor(), 3);
+        // A pause, then a gesture whose first frames are slow as the CPU
+        // wakes, and the rest fast.
+        let later = now + IDLE;
+        pacer.schedule(later);
+        assert!(pacer.take_frame(later));
+        pacer.end_frame(Duration::from_millis(20));
+        assert_eq!(pacer.divisor(), 1);
+        let mut frame = |pacer: &FramePacer, duration: Duration| loop {
+            pacer.schedule(later);
+            pacer.on_vsync(vsync);
+            vsync += period;
+            if pacer.take_frame(later) {
+                pacer.end_frame(duration);
+                break;
+            }
+        };
+        frame(&pacer, Duration::from_millis(15));
+        frame(&pacer, Duration::from_millis(12));
+        for _ in 0..20 {
+            frame(&pacer, Duration::from_millis(4));
         }
         assert_eq!(pacer.divisor(), 1);
     }

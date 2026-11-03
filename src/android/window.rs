@@ -206,6 +206,23 @@ fn load_set_frame_rate_with_change_strategy() -> Option<SetFrameRateWithChangeSt
     })
 }
 
+/// A step of the platform's fling, as GPUI takes scrolling.
+fn fling_step(step: crate::fling::Step) -> gpui::PlatformInput {
+    gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+        position: gpui::point(gpui::px(step.position.0), gpui::px(step.position.1)),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(
+            gpui::px(step.delta.0),
+            gpui::px(step.delta.1),
+        )),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: if step.ended {
+            gpui::TouchPhase::Ended
+        } else {
+            gpui::TouchPhase::Moved
+        },
+    })
+}
+
 /// A resampled touch, back in the shape the touch callback takes.
 fn sample_to_point(sample: crate::touch_resampler::Sample) -> TouchPoint {
     use crate::touch_resampler::Phase;
@@ -276,6 +293,10 @@ pub type VisibilityCallback = Box<dyn FnMut(bool) + Send + 'static>;
 
 /// Called when a key event arrives.
 pub type KeyCallback = Box<dyn FnMut(AndroidKeyEvent) + Send + 'static>;
+/// Called at the start of each frame with the time it stands for.
+pub type FrameInputCallback = Box<dyn FnMut(i64) + Send + 'static>;
+/// Called with each raw touch move: pointer id, physical position, event time.
+pub type RawMoveCallback = Box<dyn FnMut(i32, f32, f32, i64) + Send + 'static>;
 
 /// Called when the window is resized.
 pub type ResizeCallback = Box<dyn FnMut(Size<DevicePixels>, f32) + Send + 'static>;
@@ -414,6 +435,12 @@ pub struct AndroidWindow {
     /// (`touch_resampler`): one even step per frame, whatever the rate the
     /// screen reports at.
     touches: Mutex<crate::touch_resampler::TouchResampler>,
+    /// Called at the start of each frame with its time, after the touch
+    /// moves: the platform's fling steps here (`fling`).
+    frame_input: Mutex<Option<FrameInputCallback>>,
+    /// Called with every raw touch move, before it is resampled: the
+    /// platform's fling measures the finger's velocity from these (`fling`).
+    raw_moves: Mutex<Option<RawMoveCallback>>,
     /// Set when the window gets a *new* surface, cleared by the next frame.
     ///
     /// A replaced swapchain starts out empty, but GPUI only repaints what it
@@ -500,6 +527,8 @@ impl AndroidWindow {
             id,
             active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             touches: Mutex::default(),
+            frame_input: Mutex::default(),
+            raw_moves: Mutex::default(),
             force_render_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }))
     }
@@ -535,6 +564,8 @@ impl AndroidWindow {
             id: ((width as u64) << 32) | (height as u64),
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             touches: Mutex::default(),
+            frame_input: Mutex::default(),
+            raw_moves: Mutex::default(),
             force_render_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
@@ -875,6 +906,11 @@ impl AndroidWindow {
         if self.touches.lock().pending() {
             super::frame_source::schedule_frame();
         }
+        let frame_input = self.frame_input.lock().take();
+        if let Some(mut frame_input) = frame_input {
+            frame_input(frame_time);
+            self.frame_input.lock().get_or_insert(frame_input);
+        }
 
         // Take the callback out of the lock so it can be invoked without
         // holding it.  This lets `draw()` (called from inside the callback)
@@ -919,6 +955,13 @@ impl AndroidWindow {
             y: point.y,
             time: point.time.unwrap_or_else(super::frame_source::now),
         };
+        if phase == Phase::Move {
+            let raw_moves = self.raw_moves.lock().take();
+            if let Some(mut raw_moves) = raw_moves {
+                raw_moves(sample.id, sample.x, sample.y, sample.time);
+                self.raw_moves.lock().get_or_insert(raw_moves);
+            }
+        }
         let ready = self.touches.lock().push(sample);
         match ready {
             Some(sample) => self.dispatch_touch(sample_to_point(sample)),
@@ -1187,6 +1230,24 @@ impl AndroidWindow {
         F: FnMut() + Send + 'static,
     {
         self.state.lock().request_frame_callback = Some(Box::new(cb));
+    }
+
+    /// Register a callback invoked at the start of each frame with the time
+    /// it stands for (`frame_source::frame_time`), after the touch moves.
+    pub fn on_frame_input<F>(&self, cb: F)
+    where
+        F: FnMut(i64) + Send + 'static,
+    {
+        *self.frame_input.lock() = Some(Box::new(cb));
+    }
+
+    /// Register a callback invoked with each raw touch move (pointer id,
+    /// physical position, event time) before it is resampled.
+    pub fn on_raw_move<F>(&self, cb: F)
+    where
+        F: FnMut(i32, f32, f32, i64) + Send + 'static,
+    {
+        *self.raw_moves.lock() = Some(Box::new(cb));
     }
 
     /// Register a callback invoked for each touch point.
@@ -1593,8 +1654,43 @@ impl PlatformWindow for AndroidPlatformWindow {
             };
             let mut active_touches = HashMap::new();
             let mut fling_guard = crate::fling_guard::FlingGuard::new();
+            let fling = crate::fling::enabled()
+                .then(|| Arc::new(Mutex::new(crate::fling::Fling::default())));
+            if let Some(fling) = fling.clone() {
+                let cb = Arc::clone(&input_cb);
+                let stepped = Arc::clone(&fling);
+                self.window.on_frame_input(move |frame_time| {
+                    let fling = &stepped;
+                    let mut fling = fling.lock();
+                    let time = match fling.running_clock() {
+                        Some(crate::fling::Clock::Vsync) => {
+                            frame_time - crate::touch_resampler::RESAMPLE_LATENCY_NS
+                        }
+                        Some(crate::fling::Clock::Wall) => super::frame_source::now(),
+                        None => return,
+                    };
+                    if let Some(step) = fling.frame(time) {
+                        (cb.lock())(fling_step(step));
+                    }
+                    if fling.active() {
+                        super::frame_source::schedule_frame();
+                    }
+                });
+                // The velocity is the finger's: from the raw moves, as
+                // Android's own `VelocityTracker`. The resampled ones are
+                // extrapolated ahead of the finger near a release.
+                let fling = Arc::clone(&fling);
+                let window = Arc::downgrade(&self.window);
+                self.window.on_raw_move(move |id, x, y, time| {
+                    let Some(window) = window.upgrade() else {
+                        return;
+                    };
+                    let scale = window.scale_factor();
+                    fling.lock().moved(id, x / scale, y / scale, time);
+                });
+            }
             self.window.on_touch(move |touch| {
-                let phase = match touch.action {
+                let mut phase = match touch.action {
                     0 => gpui::TouchPhase::Started,
                     1 => gpui::TouchPhase::Ended,
                     2 => gpui::TouchPhase::Moved,
@@ -1616,6 +1712,49 @@ impl PlatformWindow for AndroidPlatformWindow {
                     return;
                 };
                 let scale = window.scale_factor();
+                match phase {
+                    gpui::TouchPhase::Started => super::frame_source::contact(true),
+                    gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled => {
+                        super::frame_source::contact(false)
+                    }
+                    gpui::TouchPhase::Moved => {}
+                }
+                let mut cb = cb.lock();
+                if let Some(fling) = &fling {
+                    let mut fling = fling.lock();
+                    let (x, y) = (touch.x / scale, touch.y / scale);
+                    let time = touch.time.unwrap_or_else(super::frame_source::now);
+                    match phase {
+                        gpui::TouchPhase::Started => {
+                            if let Some(step) = fling.down(touch.id, x, y, time) {
+                                cb(fling_step(step));
+                            }
+                        }
+                        // Measured from the raw moves (`on_raw_move`).
+                        gpui::TouchPhase::Moved => {}
+                        gpui::TouchPhase::Ended => {
+                            // The content shows the release resampled for
+                            // this time less the latency (`touch_resampler`):
+                            // the fling goes on from there.
+                            let clock = crate::fling::clock();
+                            let start = match clock {
+                                crate::fling::Clock::Vsync => {
+                                    time - crate::touch_resampler::RESAMPLE_LATENCY_NS
+                                }
+                                crate::fling::Clock::Wall => super::frame_source::now(),
+                            };
+                            if fling.up(touch.id, time, start, clock)
+                                == crate::fling::Release::Cancelled
+                            {
+                                phase = gpui::TouchPhase::Cancelled;
+                            }
+                            if fling.active() {
+                                super::frame_source::schedule_frame();
+                            }
+                        }
+                        gpui::TouchPhase::Cancelled => fling.cancel(touch.id),
+                    }
+                }
                 let event = gpui::TouchEvent {
                     id,
                     phase,
@@ -1623,7 +1762,6 @@ impl PlatformWindow for AndroidPlatformWindow {
                     predicted_position: None,
                     force: None,
                 };
-                let mut cb = cb.lock();
                 fling_guard.relay(event, &mut next_touch_id, |event| {
                     cb(gpui::PlatformInput::Touch(event));
                 });

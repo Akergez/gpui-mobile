@@ -970,6 +970,12 @@ impl PlatformGestures for AndroidGestures {
             // the nominal 160 dpi pairing this constructor documents is the
             // right one.
             scroll_physics: ScrollPhysics::android(),
+            // The platform flings on the frame's clock instead (`fling`).
+            min_fling_velocity: if crate::fling::enabled() {
+                f32::INFINITY
+            } else {
+                GestureTuning::default().min_fling_velocity
+            },
             // The rest of `ViewConfiguration` (touch slop, tap timeouts) is
             // close enough to GPUI's defaults to leave alone; reading the real
             // values over JNI is a separate change.
