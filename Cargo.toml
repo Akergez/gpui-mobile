@@ -113,6 +113,15 @@ android_logger = "0.15"
 # Android uses Cosmic Text and system fonts; font-kit pulls in desktop Fontconfig.
 gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.7" }
 
+# The text system (`src/android/text_system.rs`, GPUI's Cosmic Text one
+# taught variable weights): the versions gpui-pre-wgpu 0.3.7 uses.
+cosmic-text          = "0.19.0"
+swash                = "0.2.6"
+itertools            = "0.14"
+smallvec             = "1.6"
+unicode-bidi         = { version = "0.3.18", default-features = false, features = ["hardcoded-data"] }
+unicode-segmentation = "1.10"
+
 # rustc-hash is required by the PlatformKeyboardMapper trait signature
 rustc-hash = "2"
 uuid       = { version = "1", features = ["v5"] }

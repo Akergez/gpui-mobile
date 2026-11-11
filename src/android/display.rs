@@ -83,10 +83,17 @@ impl AndroidDisplay {
     }
 
     /// Create an `AndroidDisplay` and query density from an `AssetManager`.
+    ///
+    /// The scale is the density times the person's font size
+    /// ([`super::system_fonts::text_scale`]): an application's interface is
+    /// measured in rems, so its text and what is laid out around it grow
+    /// together, as an Android app's text in sp does.
     pub fn from_activity(window: &NativeWindow, asset_manager: &AssetManager) -> Self {
         let config = Configuration::from_asset_manager(asset_manager);
         let density_dpi = config.density().unwrap_or(DENSITY_DEFAULT as u32) as i32;
-        Self::from_window(window, density_dpi)
+        let mut display = Self::from_window(window, density_dpi);
+        display.scale_factor *= super::system_fonts::text_scale();
+        display
     }
 
     /// Create a synthetic `AndroidDisplay` for headless / testing use.

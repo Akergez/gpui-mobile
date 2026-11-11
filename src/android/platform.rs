@@ -32,6 +32,7 @@
 //! compiles in isolation.  Replace the stub section with `use gpui::*` when
 //! building inside the full workspace.
 
+use super::text_system::AndroidTextSystem;
 use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
@@ -41,7 +42,6 @@ use gpui::{
     PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, ScrollPhysics, Task, ThermalState,
     WindowAppearance, WindowParams,
 };
-use gpui_wgpu::CosmicTextSystem;
 use parking_lot::Mutex;
 use std::{
     cell::RefCell,
@@ -136,7 +136,7 @@ struct AndroidPlatformState {
     displays: DisplayList,
 
     // ── text ──────────────────────────────────────────────────────────────────
-    text_system: Arc<CosmicTextSystem>,
+    text_system: Arc<AndroidTextSystem>,
 
     // ── I/O ───────────────────────────────────────────────────────────────────
     clipboard: AndroidClipboard,
@@ -275,12 +275,20 @@ impl AndroidPlatform {
             AndroidDispatcher::new()
         };
 
-        let text_system = Arc::new(CosmicTextSystem::new("Roboto"));
+        // The system's text: the font its theme draws with, and the "bold
+        // text" setting (the font size is the display's, see `display.rs`).
+        // Headless (tests) there is no activity to ask.
+        let system = if headless {
+            super::system_fonts::SystemFonts::default()
+        } else {
+            super::system_fonts::system_fonts().clone()
+        };
+        let text_system = Arc::new(AndroidTextSystem::new("Roboto", system.weight_adjustment));
 
         // Load Android system fonts so GPUI's fallback chain can resolve.
         // GPUI tries ".SystemUIFont" → ".ZedMono" → … → "Noto Sans" → "DejaVu Sans" → "Arial".
         // Android ships Roboto and DroidSans in /system/fonts/.  We load them
-        // explicitly because cosmic-text's fontdb may not scan Android paths.
+        // explicitly because cosmic-text's fontdb does not scan Android paths.
         {
             let font_paths: &[&str] = &[
                 // Core UI fonts
@@ -318,6 +326,34 @@ impl AndroidPlatform {
                 "/system/fonts/NotoSerif-Bold.ttf",
             ];
             let mut font_data: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
+
+            // The system's own font first: `.SystemUIFont` is its family.
+            let mut system_family = None;
+            for face in &system.faces {
+                if font_paths.contains(&face.path.as_str()) {
+                    if system_family.is_none() {
+                        system_family = std::fs::read(&face.path)
+                            .ok()
+                            .and_then(|bytes| AndroidTextSystem::family_of(&bytes, face.index));
+                    }
+                    continue;
+                }
+                match std::fs::read(&face.path) {
+                    Ok(bytes) => {
+                        log::info!(
+                            "loaded the system's font: {} ({} bytes)",
+                            face.path,
+                            bytes.len()
+                        );
+                        if system_family.is_none() {
+                            system_family = AndroidTextSystem::family_of(&bytes, face.index);
+                        }
+                        font_data.push(std::borrow::Cow::Owned(bytes));
+                    }
+                    Err(e) => log::warn!("cannot read the system's font {}: {e}", face.path),
+                }
+            }
+
             for path in font_paths {
                 match std::fs::read(path) {
                     Ok(bytes) => {
@@ -386,6 +422,13 @@ impl AndroidPlatform {
             } else {
                 log::warn!("no system fonts found in /system/fonts/");
             }
+
+            if let Some(family) = system_family {
+                if text_system.all_font_names().contains(&family) {
+                    log::info!("the system's font for .SystemUIFont: {family}");
+                    text_system.set_system_font_family(&family);
+                }
+            }
         }
 
         let displays = if headless {
@@ -437,7 +480,7 @@ impl AndroidPlatform {
     // ── text system ───────────────────────────────────────────────────────────
 
     /// Returns the text system.
-    pub fn text_system(&self) -> Arc<CosmicTextSystem> {
+    pub fn text_system(&self) -> Arc<AndroidTextSystem> {
         self.state.lock().text_system.clone()
     }
 

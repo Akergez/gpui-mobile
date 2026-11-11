@@ -160,7 +160,9 @@ pub mod jni;
 pub mod keyboard;
 pub mod platform;
 pub mod platform_view;
+pub mod system_fonts;
 mod text_input;
+pub mod text_system;
 pub mod window;
 
 // ── public re-exports ─────────────────────────────────────────────────────────
