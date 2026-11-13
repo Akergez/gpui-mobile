@@ -19,10 +19,12 @@
 //! and the velocity GPUI fits is the finger's.
 //!
 //! `Down` passes at once (a tap must not wait for a frame); `Up` passes at
-//! once at the position resampled for its own time, which stays on the same
-//! trajectory as the frames before it; `Cancel` passes at once. Times are
-//! nanoseconds of the monotonic clock: Android's event times and vsync times
-//! are both on it.
+//! once at the position resampled for its own time unless it was already
+//! delivered behind the last frame shown. In that case it stays at the shown
+//! position: an earlier release position would drag the content backwards
+//! just before it settles, a visible backwards step. `Cancel` passes at once.
+//! Times are nanoseconds of the monotonic clock: Android's event times and
+//! vsync times are both on it.
 //!
 //! Main thread only, like everything in GPUI.
 
@@ -133,7 +135,16 @@ impl TouchResampler {
                     return Some(sample);
                 };
                 track.samples.push_back(point);
-                let (x, y) = track.position_at(sample.time - RESAMPLE_LATENCY_NS);
+                // The release cannot be earlier than the position already
+                // shown, or the content would step back before it settles.
+                let target = track.shown_time.max(sample.time - RESAMPLE_LATENCY_NS);
+                let (x, y) = if target == track.shown_time {
+                    // The release is behind the frame already drawn: stay
+                    // there, or it would step the content backwards twice.
+                    track.shown
+                } else {
+                    track.position_at(target)
+                };
                 Some(Sample { x, y, ..sample })
             }
             Phase::Cancel => {
@@ -393,6 +404,20 @@ mod tests {
         assert_eq!(up.phase, Phase::Up);
         // The finger at 79 ms, as the frames show it 5 ms late.
         assert!((up.y - 79.).abs() < 1e-4, "{}", up.y);
+    }
+
+    #[test]
+    fn a_late_release_does_not_return_behind_the_shown_position() {
+        let mut resampler = TouchResampler::default();
+        resampler.push(sample(Phase::Down, 0., 0));
+        resampler.push(sample(Phase::Move, 10., 10 * MS));
+        resampler.push(sample(Phase::Move, 20., 20 * MS));
+        // A frame extrapolated to 25 ms.
+        let shown = resampler.frame(30 * MS);
+        assert_eq!(shown.len(), 1);
+        // Up delivered later, at 20 ms: it should not rewind that frame.
+        let up = resampler.push(sample(Phase::Up, 20., 20 * MS)).unwrap();
+        assert!(up.y >= shown[0].y, "Up at {} rewinds the shown {}", up.y, shown[0].y);
     }
 
     #[test]
